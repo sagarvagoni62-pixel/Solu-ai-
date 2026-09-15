@@ -4,9 +4,9 @@ compatibility_date = "2025-09-01"
 
 # Photo storage. Create once:
 #   npx wrangler r2 bucket create solu-media
-[[r2_buckets]]
-binding = "MEDIA"
-bucket_name = "solu-media"
+#[[r2_buckets]]
+#binding = "MEDIA"
+#bucket_name = "solu-media"
 
 # Key health + job->key mapping. Create once:
 #   npx wrangler kv namespace create STATE
