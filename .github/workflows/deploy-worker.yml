@@ -1,0 +1,84 @@
+name: Deploy Worker
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["worker/**", ".github/workflows/deploy-worker.yml"]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install wrangler
+        run: npm install
+
+      - name: Sanity check secrets
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"  || { echo "::error::CLOUDFLARE_API_TOKEN secret missing"; exit 1; }
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "::error::CLOUDFLARE_ACCOUNT_ID secret missing"; exit 1; }
+          test -n "${{ secrets.GENPRESSO_API_KEYS }}" || { echo "::error::GENPRESSO_API_KEYS secret missing"; exit 1; }
+          test -n "${{ secrets.APP_SHARED_SECRET }}"  || { echo "::error::APP_SHARED_SECRET secret missing"; exit 1; }
+
+      - name: Create R2 bucket (ignore if it already exists)
+        run: npx wrangler r2 bucket create solu-media || echo "bucket already exists"
+
+      - name: Create KV namespace and wire it into wrangler.toml
+        run: |
+          npx wrangler kv namespace create STATE || echo "namespace already exists"
+
+          npx wrangler kv namespace list > ns.json
+          KV_ID=$(node -e '
+            const list = JSON.parse(require("fs").readFileSync("ns.json", "utf8"));
+            const hit = list.find(n => /(^|[-_])STATE$/.test(n.title));
+            if (!hit) { console.error("STATE namespace not found"); process.exit(1); }
+            process.stdout.write(hit.id);
+          ')
+          echo "Using KV namespace $KV_ID"
+          sed -i "s/PASTE_KV_ID_HERE/$KV_ID/" wrangler.toml
+
+      - name: Upload secrets to the Worker
+        run: |
+          printf '%s' '${{ secrets.GENPRESSO_API_KEYS }}' | npx wrangler secret put GENPRESSO_API_KEYS
+          printf '%s' '${{ secrets.APP_SHARED_SECRET }}'  | npx wrangler secret put APP_SHARED_SECRET
+
+      - name: Pin the video model when provided
+        if: ${{ vars.VIDEO_MODEL != '' }}
+        run: |
+          sed -i 's|^VIDEO_MODEL = ""|VIDEO_MODEL = "${{ vars.VIDEO_MODEL }}"|' wrangler.toml
+          grep VIDEO_MODEL wrangler.toml
+
+      - name: Deploy
+        run: npx wrangler deploy 2>&1 | tee deploy.log
+
+      - name: Show the URL and run a health check
+        run: |
+          URL=$(grep -Eo 'https://[a-z0-9.-]*workers\.dev' deploy.log | head -1)
+          echo "Worker URL: $URL"
+          {
+            echo "### Worker deployed"
+            echo
+            echo "**URL:** \`$URL\`"
+            echo
+            echo "Add this as the \`SOLU_PROXY\` repo secret, then run **Build Android**."
+            echo
+            echo "Model ids: \`$URL/v1/models\`"
+            echo
+            echo '```json'
+            curl -s "$URL/v1/health" || echo "health check failed"
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
