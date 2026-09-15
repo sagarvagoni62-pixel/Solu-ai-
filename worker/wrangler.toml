@@ -1,0 +1,35 @@
+name = "solu-ai-proxy"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+
+# Photo storage. Create once:
+#   npx wrangler r2 bucket create solu-media
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "solu-media"
+
+# Key health + job->key mapping. Create once:
+#   npx wrangler kv namespace create STATE
+# then paste the returned id below.
+[[kv_namespaces]]
+binding = "STATE"
+id = "PASTE_KV_ID_HERE"
+
+[vars]
+# Optional. Left empty the Worker uses its own request host, which is correct
+# for workers.dev. Only set this if you attach a custom domain.
+PUBLIC_BASE = ""
+
+# Video model. Leave empty to walk the built-in candidate chain
+# (Omni Flash 1.1 first). After calling GET /v1/models once, paste the exact
+# id here - that removes all guessing.
+VIDEO_MODEL = ""
+
+# Credit accounting: 230 per key, 45 per 9:16 1080p 10s video -> 5 videos/key,
+# then the pool switches to the next key automatically.
+KEY_CREDITS = "230"
+CREDITS_PER_VIDEO = "45"
+
+# Secrets (never in this file):
+#   npx wrangler secret put GENPRESSO_API_KEYS   <- all 10 keys, comma separated
+#   npx wrangler secret put APP_SHARED_SECRET
