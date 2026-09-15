@@ -1,0 +1,32 @@
+name: solu_ai
+description: Solu AI - AI video studio for every Indian family
+publish_to: "none"
+version: 3.0.0+17
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  http: ^1.2.2
+  shared_preferences: ^2.3.2
+  image_picker: ^1.1.2
+  path_provider: ^2.1.4
+  video_player: ^2.9.2
+  share_plus: ^10.0.2
+  uuid: ^4.5.1
+  url_launcher: ^6.3.0
+
+dev_dependencies:
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/brand/
+    - assets/posters/
+    - assets/images/
+    - assets/videos/
+    - assets/audio/
