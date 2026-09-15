@@ -43,11 +43,9 @@ class _ResultScreenState extends State<ResultScreen> {
   }
 
   Future<void> _share() async {
-    await SharePlus.instance.share(
-      ShareParams(
-        files: [XFile(widget.file.path)],
-        text: '${widget.scene.title} - Solu AI se banaya',
-      ),
+    await Share.shareXFiles(
+      [XFile(widget.file.path)],
+      text: '${widget.scene.title} - Solu AI se banaya',
     );
   }
 

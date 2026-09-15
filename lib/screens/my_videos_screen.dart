@@ -124,9 +124,8 @@ class _MyVideosScreenState extends State<MyVideosScreen> {
                       ),
                       IconButton(
                         icon: const Icon(Icons.share_outlined, size: 20),
-                        onPressed: () => SharePlus.instance.share(
-                          ShareParams(files: [XFile(item.filePath)]),
-                        ),
+                        onPressed: () =>
+                            Share.shareXFiles([XFile(item.filePath)]),
                       ),
                       IconButton(
                         icon: const Icon(Icons.delete_outline,
