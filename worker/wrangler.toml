@@ -1,6 +1,7 @@
 name = "solu-ai-proxy"
 main = "src/index.ts"
 compatibility_date = "2025-09-01"
+workers_dev = true
 
 # Photo storage. Create once:
 #   npx wrangler r2 bucket create solu-media
