@@ -322,17 +322,34 @@ export default {
 			})
 		}
 
-		// public: serve uploaded photos from R2
+		// public: serve uploaded photos (R2 when the account has it, else KV)
 		if (req.method === "GET" && path.startsWith("/f/")) {
-			if (!env.MEDIA) return fail("no_storage", "R2 bucket not bound", 500)
-			const obj = await env.MEDIA.get(path.slice(3))
-			if (!obj) return fail("not_found", "file not found", 404)
-			return new Response(obj.body, {
-				headers: {
-					"content-type": obj.httpMetadata?.contentType ?? "image/jpeg",
-					"cache-control": "public, max-age=86400",
-				},
-			})
+			const fileKey = path.slice(3)
+
+			if (env.MEDIA) {
+				const obj = await env.MEDIA.get(fileKey)
+				if (!obj) return fail("not_found", "file not found", 404)
+				return new Response(obj.body, {
+					headers: {
+						"content-type": obj.httpMetadata?.contentType ?? "image/jpeg",
+						"cache-control": "public, max-age=86400",
+					},
+				})
+			}
+
+			if (env.STATE) {
+				const hit = await env.STATE.getWithMetadata(`f:${fileKey}`, "arrayBuffer")
+				if (!hit.value) return fail("not_found", "file not found or expired", 404)
+				const meta = (hit.metadata ?? {}) as { contentType?: string }
+				return new Response(hit.value, {
+					headers: {
+						"content-type": meta.contentType ?? "image/jpeg",
+						"cache-control": "public, max-age=86400",
+					},
+				})
+			}
+
+			return fail("no_storage", "no storage binding", 500)
 		}
 
 		if (path === "/v1/health") {
@@ -340,7 +357,7 @@ export default {
 				ok: true,
 				mode: "reference-to-video",
 				scenes: SCENES.length,
-				storage: Boolean(env.MEDIA),
+				storage: env.MEDIA ? "r2" : env.STATE ? "kv" : false,
 				...(await (async () => {
 					const p = await buildPool(env)
 					return {
@@ -414,7 +431,7 @@ export default {
 
 		// photo upload -> public URL
 		if (req.method === "POST" && path === "/v1/upload") {
-			if (!env.MEDIA) return fail("no_storage", "R2 bucket not bound", 500)
+			if (!env.MEDIA && !env.STATE) return fail("no_storage", "no storage binding", 500)
 			const form = await req.formData().catch(() => null)
 			const file = form?.get("file")
 			if (!(file instanceof File)) return fail("photo_required", "no file field", 400)
@@ -422,9 +439,17 @@ export default {
 
 			const ext = (file.type.split("/")[1] || "jpg").replace("jpeg", "jpg")
 			const key = `u/${Date.now()}-${crypto.randomUUID()}.${ext}`
-			await env.MEDIA.put(key, file.stream(), {
-				httpMetadata: { contentType: file.type || "image/jpeg" },
-			})
+			const contentType = file.type || "image/jpeg"
+			if (env.MEDIA) {
+				await env.MEDIA.put(key, file.stream(), { httpMetadata: { contentType } })
+			} else {
+				// No R2 on this account: keep the photo in KV for 24h. The provider
+				// only needs the URL long enough to fetch the reference image.
+				await env.STATE!.put(`f:${key}`, await file.arrayBuffer(), {
+					expirationTtl: 60 * 60 * 24,
+					metadata: { contentType },
+				})
+			}
 			const base = env.PUBLIC_BASE || `${url.protocol}//${url.host}`
 			return json({ url: `${base}/f/${key}`, key })
 		}
