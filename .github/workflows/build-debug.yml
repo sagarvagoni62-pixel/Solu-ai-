@@ -1,5 +1,9 @@
 name: Build Debug APK
 
+# Phone testing build. No keystore needed - Flutter signs it with the standard
+# debug key, so it installs on any phone with "unknown sources" allowed.
+# Needs only two secrets: SOLU_PROXY and SOLU_APP_KEY.
+
 on:
   workflow_dispatch:
 
@@ -44,3 +48,12 @@ jobs:
           name: solu-debug-apk
           path: out/solu-ai-debug.apk
           retention-days: 14
+
+      - name: Summary
+        run: |
+          {
+            echo "### Debug APK ready"
+            echo
+            echo "Download solu-debug-apk from the Artifacts section of this run,"
+            echo "unzip it, then install solu-ai-debug.apk on the phone."
+          } >> "$GITHUB_STEP_SUMMARY"
