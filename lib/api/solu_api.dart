@@ -29,7 +29,8 @@ class SoluJob {
 class SoluResult {
   final JobState state;
   final List<SoluAsset> assets;
-  const SoluResult(this.state, [this.assets = const []]);
+  final String? error;
+  const SoluResult(this.state, [this.assets = const [], this.error]);
   SoluAsset? get first => assets.isEmpty ? null : assets.first;
 }
 
@@ -41,15 +42,23 @@ class SoluException implements Exception {
   @override
   String toString() => 'SoluException($code): $message';
 
-  /// Ready-to-show Hinglish copy.
+  /// Ready-to-show Hinglish copy. Unknown codes are shown as-is so a single
+  /// screenshot is enough to debug the backend.
   String get userMessage {
     switch (code) {
       case 'not_configured':
         return 'App server se connect nahi hai. Thodi der baad try karein.';
+      case 'unauthorized':
+      case 'http_401':
+        return 'Server ne app key reject ki (401). Backend key update karni hai.';
+      case 'no_storage':
+        return 'Server storage set nahi hai (KV). Backend fix chahiye.';
       case 'photo_required':
         return 'Pehle photo choose karein.';
       case 'second_photo_required':
         return 'Is scene ke liye 2 photo chahiye.';
+      case 'too_large':
+        return 'Photo bahut badi hai. Chhoti photo choose karein.';
       case 'face_not_clear':
         return 'Chehra saaf nahi hai. Doosri photo try karein.';
       case 'moderation':
@@ -60,12 +69,14 @@ class SoluException implements Exception {
         return 'Server balance khatam hai. Hum jaldi theek kar rahe hain.';
       case 'upload_failed':
         return 'Photo upload nahi hui. Internet check karein.';
+      case 'upstream_error':
+        return 'Video service ne request reject ki.\n\n$message';
       case 'network':
         return 'Internet connection check karein.';
       case 'timeout':
         return 'Zyada waqt lag raha hai. My Videos me baad me check karein.';
       default:
-        return 'Kuch galat ho gaya. Dobara koshish karein.';
+        return 'Kuch galat ho gaya.\n\ncode: $code\n$message';
     }
   }
 }
@@ -103,6 +114,69 @@ class SoluApi {
     if (!SoluConfig.isConfigured) {
       throw SoluException('not_configured', 'proxy base is empty');
     }
+  }
+
+  // ----------------------------------------------------------- diagnostics
+
+  /// Public health endpoint, no app key needed.
+  Future<Map<String, dynamic>> health() async {
+    final r = await _http
+        .get(_u('/v1/health'))
+        .timeout(const Duration(seconds: 20));
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      throw SoluException('http_${r.statusCode}', r.body);
+    }
+    return Map<String, dynamic>.from(jsonDecode(r.body) as Map);
+  }
+
+  /// One-tap check of every link in the chain. Rendered as plain text so it
+  /// can be screenshotted and acted on directly.
+  Future<String> selfTest() async {
+    final out = <String>['proxy: ${SoluConfig.proxyBase}'];
+
+    Map<String, dynamic> h;
+    try {
+      h = await health();
+    } catch (e) {
+      out.add('server: FAIL — $e');
+      return out.join('\n');
+    }
+    out.add('server: OK (${h['provider']})');
+    out.add('api keys loaded: ${h['keys']}');
+    out.add('configured: ${h['configured']}');
+    out.add('storage: ${h['storage']}');
+    out.add('image model: ${h['imageModel']}');
+    out.add('video model: ${h['videoModel']}');
+
+    try {
+      final keys = await _get('/v1/keys');
+      final list = (keys['keys'] as List?) ?? const [];
+      out.add('app key: OK');
+      for (final k in list) {
+        final m = Map<String, dynamic>.from(k as Map);
+        final bad = m['invalid'] == true
+            ? 'INVALID'
+            : m['cooldownUntil'] != null
+                ? 'cooldown'
+                : 'ready';
+        out.add('  ${m['fingerprint']} → $bad ${m['lastError'] ?? ''}'.trimRight());
+      }
+    } on SoluException catch (e) {
+      out.add('app key: FAIL — ${e.code}');
+    } catch (e) {
+      out.add('app key: FAIL — $e');
+    }
+
+    try {
+      final up = await _get('/v1/upstream?path=/generation-options');
+      out.add('upstream: OK ${jsonEncode(up['data']).substring(0, 180)}…');
+    } on SoluException catch (e) {
+      out.add('upstream: FAIL — ${e.code}: ${e.message}');
+    } catch (e) {
+      out.add('upstream: FAIL — $e');
+    }
+
+    return out.join('\n');
   }
 
   // ---------------------------------------------------------------- scenes
@@ -159,7 +233,7 @@ class SoluApi {
 
   // ------------------------------------------------------------- generate
 
-  /// [imageRef] is the value returned by [uploadPhoto].
+  /// [imageUrl] is the value returned by [uploadPhoto].
   Future<SoluJob> submit({
     required String sceneId,
     required String imageUrl,
@@ -197,6 +271,7 @@ class SoluApi {
     return SoluResult(
       _parse((res['state'] as String?) ?? (res['status'] as String?)),
       assets,
+      res['error'] as String?,
     );
   }
 
@@ -228,13 +303,16 @@ class SoluApi {
       final next = delay.inSeconds + 1;
       delay = Duration(seconds: next > 10 ? 10 : next);
 
-      final st = await status(job.id);
-      if (st == JobState.completed) {
+      final res = await result(job.id);
+      if (res.state == JobState.completed) {
         onProgress?.call(0.95);
-        return result(job.id);
+        return res;
       }
-      if (st == JobState.failed || st == JobState.expired) {
-        return SoluResult(st);
+      if (res.state == JobState.failed || res.state == JobState.expired) {
+        if (res.error != null && res.error!.isNotEmpty) {
+          throw SoluException('upstream_error', res.error!);
+        }
+        return res;
       }
       progress += 0.045;
       if (progress > 0.9) progress = 0.9;
@@ -312,7 +390,13 @@ class SoluApi {
         ? 'insufficient_credits'
         : r.statusCode == 429
             ? 'rate_limited'
-            : 'http_${r.statusCode}';
-    throw SoluException(code, (err?['message'] as String?) ?? 'request failed');
+            : r.statusCode == 401
+                ? 'unauthorized'
+                : 'http_${r.statusCode}';
+    throw SoluException(
+      code,
+      (err?['message'] as String?) ??
+          (r.body.isEmpty ? 'request failed' : r.body.substring(0, r.body.length > 300 ? 300 : r.body.length)),
+    );
   }
 }
