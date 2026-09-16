@@ -15,6 +15,8 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      BLITZ_KEYS: ${{ secrets.BLITZREELS_API_KEYS || secrets.GENPRESSO_API_KEYS }}
+      APP_SHARED_SECRET: ${{ secrets.APP_SHARED_SECRET }}
 
     steps:
       - uses: actions/checkout@v4
@@ -30,30 +32,13 @@ jobs:
         run: |
           test -n "$CLOUDFLARE_API_TOKEN"  || { echo "::error::CLOUDFLARE_API_TOKEN secret missing"; exit 1; }
           test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "::error::CLOUDFLARE_ACCOUNT_ID secret missing"; exit 1; }
-          test -n "${{ secrets.GENPRESSO_API_KEYS }}" || { echo "::error::GENPRESSO_API_KEYS secret missing"; exit 1; }
-          test -n "${{ secrets.APP_SHARED_SECRET }}"  || { echo "::error::APP_SHARED_SECRET secret missing"; exit 1; }
-
-      - name: Create R2 bucket (ignore if it already exists)
-        run: npx wrangler r2 bucket create solu-media || echo "bucket already exists"
-
-      - name: Create KV namespace and wire it into wrangler.toml
-        run: |
-          npx wrangler kv namespace create STATE || echo "namespace already exists"
-
-          npx wrangler kv namespace list > ns.json
-          KV_ID=$(node -e '
-            const list = JSON.parse(require("fs").readFileSync("ns.json", "utf8"));
-            const hit = list.find(n => /(^|[-_])STATE$/.test(n.title));
-            if (!hit) { console.error("STATE namespace not found"); process.exit(1); }
-            process.stdout.write(hit.id);
-          ')
-          echo "Using KV namespace $KV_ID"
-          sed -i "s/PASTE_KV_ID_HERE/$KV_ID/" wrangler.toml
+          test -n "$BLITZ_KEYS" || { echo "::error::Add the BLITZREELS_API_KEYS secret (br_live_...)"; exit 1; }
+          test -n "$APP_SHARED_SECRET" || { echo "::error::APP_SHARED_SECRET secret missing"; exit 1; }
 
       - name: Upload secrets to the Worker
         run: |
-          printf '%s' '${{ secrets.GENPRESSO_API_KEYS }}' | npx wrangler secret put GENPRESSO_API_KEYS
-          printf '%s' '${{ secrets.APP_SHARED_SECRET }}'  | npx wrangler secret put APP_SHARED_SECRET
+          printf '%s' "$BLITZ_KEYS" | npx wrangler secret put BLITZREELS_API_KEYS || true
+          printf '%s' "$APP_SHARED_SECRET" | npx wrangler secret put APP_SHARED_SECRET || true
 
       - name: Pin the video model when provided
         if: ${{ vars.VIDEO_MODEL != '' }}
@@ -73,11 +58,8 @@ jobs:
             echo
             echo "**URL:** \`$URL\`"
             echo
-            echo "Add this as the \`SOLU_PROXY\` repo secret, then run **Build Android**."
-            echo
-            echo "Model ids: \`$URL/v1/models\`"
-            echo
             echo '```json'
+            sleep 5
             curl -s "$URL/v1/health" || echo "health check failed"
             echo
             echo '```'
