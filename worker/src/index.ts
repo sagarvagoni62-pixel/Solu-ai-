@@ -117,6 +117,10 @@ function authed(req: Request, env: Env): boolean {
 	return req.headers.get("x-solu-key") === env.APP_SHARED_SECRET
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 /* -------------------------------------------------------------- single key */
 
 /** The one BlitzReels key used for both image and video generation. */
@@ -160,53 +164,156 @@ async function br<T>(env: Env, path: string, init: RequestInit = {}): Promise<Br
 
 /* ------------------------------------------------------------ media upload */
 
-type UploadInit = { upload_url: string; storage_key: string; expires_in?: number }
+type UploadInit = { upload_url?: string; storage_key?: string; expires_in?: number }
 
-const FINALIZE_PATHS = [
-	"/workspace/media/upload/complete",
-	"/workspace/media/upload/finalize",
+const UPLOAD_INIT_PATHS = ["/workspace/media/upload/init", "/media/upload/init"]
+const FINALIZE_PATHS = ["/workspace/media/upload/complete", "/workspace/media/upload/finalize"]
+const IMPORT_PATHS = [
+	"/workspace/media/import-url",
+	"/workspace/media/import",
+	"/media/import-url",
 ]
+
+function assetIdOf(d: Record<string, any>): string | undefined {
+	const v = d.asset_id || d.assetId || d.id || d.asset?.id || d.media?.id || d.media_id
+	return v ? String(v) : undefined
+}
+
+/** Presigned flow: init -> PUT -> finalize. Retries the flaky init step. */
+async function presignedUpload(
+	env: Env,
+	bytes: ArrayBuffer,
+	fileName: string,
+	contentType: string,
+	log: string[],
+): Promise<string | null> {
+	const bodies: Record<string, unknown>[] = [
+		{ file_name: fileName, content_type: contentType, size_bytes: bytes.byteLength },
+		{ file_name: fileName, content_type: contentType },
+		{ file_name: fileName, mime_type: contentType, size_bytes: bytes.byteLength },
+		{ file_name: fileName, content_type: contentType, folder_id: "root" },
+	]
+
+	for (const path of UPLOAD_INIT_PATHS) {
+		for (const body of bodies) {
+			for (let attempt = 1; attempt <= 3; attempt++) {
+				const init = await br<UploadInit>(env, path, {
+					method: "POST",
+					body: JSON.stringify(body),
+				})
+
+				if (init.ok && init.data.upload_url) {
+					const put = await fetch(init.data.upload_url, {
+						method: "PUT",
+						headers: { "content-type": contentType },
+						body: bytes,
+					})
+					if (!put.ok) {
+						log.push(`put ${put.status}`)
+						break
+					}
+					const payload = JSON.stringify({
+						storage_key: init.data.storage_key,
+						file_name: fileName,
+						content_type: contentType,
+						size_bytes: bytes.byteLength,
+					})
+					for (const finalizePath of FINALIZE_PATHS) {
+						const done = await br<Record<string, any>>(env, finalizePath, {
+							method: "POST",
+							body: payload,
+						})
+						if (done.ok) {
+							const id = assetIdOf(done.data)
+							if (id) return id
+							log.push(`finalize ok but no asset id: ${JSON.stringify(done.data).slice(0, 160)}`)
+						} else {
+							log.push(`finalize ${finalizePath} ${done.status}`)
+						}
+					}
+					break
+				}
+
+				const status = init.ok ? 200 : init.status
+				log.push(`init ${path} [${Object.keys(body).join(",")}] -> ${status}`)
+
+				// Their init handler returns a retryable 500 fairly often.
+				if (!init.ok && init.status >= 500 && attempt < 3) {
+					await sleep(700 * attempt)
+					continue
+				}
+				break
+			}
+		}
+	}
+	return null
+}
+
+/**
+ * Fallback: park the bytes on this Worker, expose them at a short-lived public
+ * URL and ask BlitzReels to import that URL instead.
+ */
+async function importUpload(
+	env: Env,
+	bytes: ArrayBuffer,
+	fileName: string,
+	contentType: string,
+	origin: string,
+	log: string[],
+): Promise<string | null> {
+	if (!env.STATE) {
+		log.push("import skipped: no KV")
+		return null
+	}
+
+	const id = crypto.randomUUID()
+	await env.STATE.put(`f:${id}`, bytes, {
+		metadata: { ct: contentType },
+		expirationTtl: 60 * 60 * 24,
+	})
+	const publicUrl = `${origin}/v1/f/${id}`
+
+	const bodies: Record<string, unknown>[] = [
+		{ url: publicUrl, file_name: fileName },
+		{ source_url: publicUrl, file_name: fileName },
+		{ media_url: publicUrl, file_name: fileName },
+	]
+
+	for (const path of IMPORT_PATHS) {
+		for (const body of bodies) {
+			const res = await br<Record<string, any>>(env, path, {
+				method: "POST",
+				body: JSON.stringify(body),
+			})
+			if (res.ok) {
+				const assetId = assetIdOf(res.data)
+				if (assetId) return assetId
+				log.push(`import ok but no asset id: ${JSON.stringify(res.data).slice(0, 160)}`)
+				continue
+			}
+			log.push(`import ${path} [${Object.keys(body).join(",")}] -> ${res.status}`)
+			if (res.status === 404) break // path does not exist, try the next one
+		}
+	}
+	return null
+}
 
 async function uploadToBlitz(
 	env: Env,
 	bytes: ArrayBuffer,
 	fileName: string,
 	contentType: string,
+	origin: string,
 ): Promise<{ assetId: string } | { error: string; status: number }> {
-	const init = await br<UploadInit>(env, "/workspace/media/upload/init", {
-		method: "POST",
-		body: JSON.stringify({ file_name: fileName, content_type: contentType }),
-	})
-	if (!init.ok) return { error: `upload_init_failed: ${init.body}`, status: init.status }
+	const log: string[] = []
 
-	const put = await fetch(init.data.upload_url, {
-		method: "PUT",
-		headers: { "content-type": contentType },
-		body: bytes,
-	})
-	if (!put.ok) return { error: `presigned_put_failed: ${put.status}`, status: 502 }
+	const direct = await presignedUpload(env, bytes, fileName, contentType, log)
+	if (direct) return { assetId: direct }
 
-	const payload = JSON.stringify({
-		storage_key: init.data.storage_key,
-		file_name: fileName,
-		content_type: contentType,
-		size_bytes: bytes.byteLength,
-	})
-	for (const path of FINALIZE_PATHS) {
-		const done = await br<Record<string, any>>(env, path, { method: "POST", body: payload })
-		if (done.ok) {
-			const d = done.data
-			const assetId =
-				d.asset_id || d.assetId || d.id || d.asset?.id || d.media?.id || d.media_id
-			if (assetId) return { assetId: String(assetId) }
-			return {
-				error: `finalize_missing_asset_id: ${JSON.stringify(d).slice(0, 300)}`,
-				status: 502,
-			}
-		}
-		if (done.status !== 404) return { error: `finalize_failed: ${done.body}`, status: done.status }
-	}
-	return { error: "finalize_route_not_found", status: 502 }
+	const imported = await importUpload(env, bytes, fileName, contentType, origin, log)
+	if (imported) return { assetId: imported }
+
+	return { error: `upload_failed_all_routes: ${log.join(" | ").slice(0, 500)}`, status: 502 }
 }
 
 /* ------------------------------------------------------------------- flows */
@@ -498,6 +605,18 @@ export default {
 			})
 		}
 
+		/** Short-lived public file used by the URL-import upload fallback. */
+		const fileMatch = path.match(/^\/v1\/f\/([A-Za-z0-9-]+)$/)
+		if (fileMatch && req.method === "GET") {
+			if (!env.STATE) return fail("no_storage", "KV namespace STATE is not bound", 500)
+			const found = await env.STATE.getWithMetadata(`f:${fileMatch[1]}`, "arrayBuffer")
+			if (!found.value) return fail("not_found", "File expired", 404)
+			const ct = (found.metadata as { ct?: string } | null)?.ct || "image/jpeg"
+			return new Response(found.value, {
+				headers: { "content-type": ct, "cache-control": "public, max-age=3600", ...CORS },
+			})
+		}
+
 		if (!authed(req, env)) return fail("unauthorized", "Missing or invalid x-solu-key", 401)
 
 		/** Diagnostics: shows the upstream's real model ids and credit pricing. */
@@ -524,7 +643,13 @@ export default {
 			const bytes = await file.arrayBuffer()
 			const contentType = file.type || "image/jpeg"
 			const ext = contentType.includes("png") ? "png" : "jpg"
-			const res = await uploadToBlitz(env, bytes, `solu-${crypto.randomUUID()}.${ext}`, contentType)
+			const res = await uploadToBlitz(
+				env,
+				bytes,
+				`solu-${crypto.randomUUID()}.${ext}`,
+				contentType,
+				url.origin,
+			)
 			if ("error" in res) return fail("upstream_error", res.error, res.status)
 			return json({ assetId: res.assetId })
 		}
