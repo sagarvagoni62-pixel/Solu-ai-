@@ -1,5 +1,5 @@
 /**
- * Solu AI proxy — BlitzReels two-stage pipeline.
+ * Solu AI proxy — BlitzReels two-stage pipeline, single API key.
  *
  * Stage 1 (hidden from the user): generate a full-body character sheet of the
  * uploaded person wearing white "swarg" clothes, using an image model with the
@@ -11,15 +11,13 @@
  */
 
 export interface Env {
-	BLITZREELS_API_KEYS?: string
 	BLITZREELS_API_KEY?: string
-	GENPRESSO_API_KEYS?: string
+	/** Legacy name, still accepted; only the first key is used. */
+	BLITZREELS_API_KEYS?: string
 	APP_SHARED_SECRET: string
 	STATE?: KVNamespace
-	PUBLIC_BASE?: string
 	IMAGE_MODEL?: string
 	VIDEO_MODEL?: string
-	ADMIN_SECRET?: string
 }
 
 const BR_BASE = "https://blitzreels.com/api/v1"
@@ -110,8 +108,8 @@ function json(data: unknown, status = 200): Response {
 	})
 }
 
-function fail(code: string, message: string, status = 400, extra: Record<string, unknown> = {}) {
-	return json({ error: { code, message, ...extra } }, status)
+function fail(code: string, message: string, status = 400) {
+	return json({ error: { code, message } }, status)
 }
 
 function authed(req: Request, env: Env): boolean {
@@ -119,132 +117,45 @@ function authed(req: Request, env: Env): boolean {
 	return req.headers.get("x-solu-key") === env.APP_SHARED_SECRET
 }
 
-/* ---------------------------------------------------------------- key pool */
+/* -------------------------------------------------------------- single key */
 
-type KeyState = { cooldownUntil?: number; invalid?: boolean; lastError?: string }
-type PoolState = Record<string, KeyState>
-
-const POOL_STATE_KEY = "brkeys:v1"
-const COOLDOWN_NO_CREDITS = 6 * 60 * 60 * 1000
-const COOLDOWN_RATE_LIMIT = 60 * 1000
-
-function rawKeys(env: Env): string[] {
-	const blob = [env.BLITZREELS_API_KEYS, env.BLITZREELS_API_KEY, env.GENPRESSO_API_KEYS]
-		.filter(Boolean)
-		.join(",")
-	const seen = new Set<string>()
-	const out: string[] = []
-	for (const part of blob.split(/[,\s\n]+/)) {
-		const k = part.trim()
-		if (!k || seen.has(k)) continue
-		seen.add(k)
-		out.push(k)
-	}
-	return out
+/** The one BlitzReels key used for both image and video generation. */
+function apiKey(env: Env): string {
+	const raw = (env.BLITZREELS_API_KEY || env.BLITZREELS_API_KEYS || "").trim()
+	// Tolerate a legacy comma/newline separated value by taking the first entry.
+	return raw.split(/[,\s\n]+/).filter(Boolean)[0] || ""
 }
 
-function fpOf(key: string): string {
-	return `${key.slice(0, 11)}…${key.slice(-4)}`
-}
+type BrResult<T> = { ok: true; data: T } | { ok: false; status: number; body: string }
 
-async function loadPool(env: Env): Promise<PoolState> {
-	if (!env.STATE) return {}
-	try {
-		return ((await env.STATE.get(POOL_STATE_KEY, "json")) as PoolState) || {}
-	} catch {
-		return {}
-	}
-}
+/** Calls BlitzReels with the single key and normalises the result. */
+async function br<T>(env: Env, path: string, init: RequestInit = {}): Promise<BrResult<T>> {
+	const key = apiKey(env)
+	if (!key) return { ok: false, status: 500, body: "BLITZREELS_API_KEY is not set" }
 
-async function savePool(env: Env, pool: PoolState): Promise<void> {
-	if (!env.STATE) return
-	try {
-		await env.STATE.put(POOL_STATE_KEY, JSON.stringify(pool))
-	} catch {
-		/* ignore */
-	}
-}
-
-async function orderedKeys(env: Env): Promise<string[]> {
-	const pool = await loadPool(env)
-	const now = Date.now()
-	const all = rawKeys(env)
-	const ready = all.filter((k) => {
-		const st = pool[fpOf(k)]
-		if (!st) return true
-		if (st.invalid) return false
-		return !st.cooldownUntil || st.cooldownUntil <= now
-	})
-	// If every key is cooling down, still try them rather than hard-failing.
-	return ready.length ? ready : all.filter((k) => !pool[fpOf(k)]?.invalid)
-}
-
-async function markKey(env: Env, key: string, patch: KeyState): Promise<void> {
-	const pool = await loadPool(env)
-	pool[fpOf(key)] = { ...(pool[fpOf(key)] || {}), ...patch }
-	await savePool(env, pool)
-}
-
-type BrResult<T> = { ok: true; data: T; key: string } | { ok: false; status: number; body: string }
-
-async function br(path: string, key: string, init: RequestInit = {}): Promise<Response> {
 	const headers: Record<string, string> = {
 		authorization: `Bearer ${key}`,
 		...((init.headers as Record<string, string>) || {}),
 	}
 	if (init.body && !headers["content-type"]) headers["content-type"] = "application/json"
-	return fetch(`${BR_BASE}${path}`, { ...init, headers })
-}
 
-/** Runs `attempt` against each healthy key, rotating on auth/credit/rate errors. */
-async function withKeys<T>(
-	env: Env,
-	attempt: (key: string) => Promise<Response>,
-): Promise<BrResult<T>> {
-	const keys = await orderedKeys(env)
-	if (!keys.length) return { ok: false, status: 500, body: "no api keys configured" }
-	let last: { status: number; body: string } = { status: 500, body: "no attempt made" }
-	for (const key of keys) {
-		let res: Response
-		try {
-			res = await attempt(key)
-		} catch (err) {
-			last = { status: 502, body: String(err) }
-			continue
-		}
-		const text = await res.text()
-		if (res.ok) {
-			let data: unknown = null
-			try {
-				data = text ? JSON.parse(text) : {}
-			} catch {
-				data = {}
-			}
-			return { ok: true, data: data as T, key }
-		}
-		last = { status: res.status, body: text.slice(0, 600) }
-		if (res.status === 401 || res.status === 403) {
-			await markKey(env, key, { invalid: true, lastError: "unauthorized" })
-			continue
-		}
-		if (res.status === 402 || /credit|balance|quota/i.test(text)) {
-			await markKey(env, key, {
-				cooldownUntil: Date.now() + COOLDOWN_NO_CREDITS,
-				lastError: "out of credits",
-			})
-			continue
-		}
-		if (res.status === 429) {
-			await markKey(env, key, {
-				cooldownUntil: Date.now() + COOLDOWN_RATE_LIMIT,
-				lastError: "rate limited",
-			})
-			continue
-		}
-		// 4xx/5xx that is not key-specific: no point trying other keys.
-		return { ok: false, status: res.status, body: last.body }
+	let res: Response
+	try {
+		res = await fetch(`${BR_BASE}${path}`, { ...init, headers })
+	} catch (err) {
+		return { ok: false, status: 502, body: String(err) }
 	}
-	return { ok: false, status: last.status, body: last.body }
+
+	const text = await res.text()
+	if (!res.ok) return { ok: false, status: res.status, body: text.slice(0, 600) }
+
+	let data: unknown = {}
+	try {
+		data = text ? JSON.parse(text) : {}
+	} catch {
+		data = {}
+	}
+	return { ok: true, data: data as T }
 }
 
 /* ------------------------------------------------------------ media upload */
@@ -261,13 +172,11 @@ async function uploadToBlitz(
 	bytes: ArrayBuffer,
 	fileName: string,
 	contentType: string,
-): Promise<{ assetId: string; key: string } | { error: string; status: number }> {
-	const init = await withKeys<UploadInit>(env, (key) =>
-		br("/workspace/media/upload/init", key, {
-			method: "POST",
-			body: JSON.stringify({ file_name: fileName, content_type: contentType }),
-		}),
-	)
+): Promise<{ assetId: string } | { error: string; status: number }> {
+	const init = await br<UploadInit>(env, "/workspace/media/upload/init", {
+		method: "POST",
+		body: JSON.stringify({ file_name: fileName, content_type: contentType }),
+	})
 	if (!init.ok) return { error: `upload_init_failed: ${init.body}`, status: init.status }
 
 	const put = await fetch(init.data.upload_url, {
@@ -275,9 +184,7 @@ async function uploadToBlitz(
 		headers: { "content-type": contentType },
 		body: bytes,
 	})
-	if (!put.ok) {
-		return { error: `presigned_put_failed: ${put.status}`, status: 502 }
-	}
+	if (!put.ok) return { error: `presigned_put_failed: ${put.status}`, status: 502 }
 
 	const payload = JSON.stringify({
 		storage_key: init.data.storage_key,
@@ -286,19 +193,18 @@ async function uploadToBlitz(
 		size_bytes: bytes.byteLength,
 	})
 	for (const path of FINALIZE_PATHS) {
-		const done = await withKeys<Record<string, any>>(env, (key) =>
-			br(path, key, { method: "POST", body: payload }),
-		)
+		const done = await br<Record<string, any>>(env, path, { method: "POST", body: payload })
 		if (done.ok) {
-			const d = done.data as Record<string, any>
+			const d = done.data
 			const assetId =
 				d.asset_id || d.assetId || d.id || d.asset?.id || d.media?.id || d.media_id
-			if (assetId) return { assetId: String(assetId), key: done.key }
-			return { error: `finalize_missing_asset_id: ${JSON.stringify(d).slice(0, 300)}`, status: 502 }
+			if (assetId) return { assetId: String(assetId) }
+			return {
+				error: `finalize_missing_asset_id: ${JSON.stringify(d).slice(0, 300)}`,
+				status: 502,
+			}
 		}
-		if (done.status !== 404) {
-			return { error: `finalize_failed: ${done.body}`, status: done.status }
-		}
+		if (done.status !== 404) return { error: `finalize_failed: ${done.body}`, status: done.status }
 	}
 	return { error: "finalize_route_not_found", status: 502 }
 }
@@ -315,7 +221,6 @@ type Flow = {
 	videoJobId?: string
 	videoModel?: string
 	videoUrl?: string
-	thumbUrl?: string
 	error?: string
 	credits?: number
 	createdAt: number
@@ -392,7 +297,7 @@ function pickAssetId(job: JobResponse): string | undefined {
 }
 
 async function getJob(env: Env, jobId: string): Promise<BrResult<JobResponse>> {
-	return withKeys<JobResponse>(env, (key) => br(`/generation-jobs/${jobId}`, key))
+	return br<JobResponse>(env, `/generation-jobs/${jobId}`)
 }
 
 async function submitCharacterSheet(
@@ -400,16 +305,16 @@ async function submitCharacterSheet(
 	scene: Scene,
 	sourceAssetId: string,
 ): Promise<BrResult<JobResponse>> {
-	const body = {
-		prompt: scene.sheetPrompt || CHARACTER_SHEET_PROMPT,
-		model: env.IMAGE_MODEL || DEFAULT_IMAGE_MODEL,
-		aspect_ratio: "9:16",
-		reference_asset_ids: [sourceAssetId],
-		enhance_prompt: false,
-	}
-	return withKeys<JobResponse>(env, (key) =>
-		br("/generate-image", key, { method: "POST", body: JSON.stringify(body) }),
-	)
+	return br<JobResponse>(env, "/generate-image", {
+		method: "POST",
+		body: JSON.stringify({
+			prompt: scene.sheetPrompt || CHARACTER_SHEET_PROMPT,
+			model: env.IMAGE_MODEL || DEFAULT_IMAGE_MODEL,
+			aspect_ratio: "9:16",
+			reference_asset_ids: [sourceAssetId],
+			enhance_prompt: false,
+		}),
+	})
 }
 
 /**
@@ -439,9 +344,10 @@ async function submitVideo(
 			{ ...base, model },
 		]
 		for (const body of variants) {
-			const res = await withKeys<JobResponse>(env, (key) =>
-				br("/generate-video", key, { method: "POST", body: JSON.stringify(body) }),
-			)
+			const res = await br<JobResponse>(env, "/generate-video", {
+				method: "POST",
+				body: JSON.stringify(body),
+			})
 			if (res.ok) return { result: res, model }
 			last = res
 			// Only keep probing when the upstream rejected the shape or the model id.
@@ -565,8 +471,7 @@ export default {
 		if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS })
 
 		if (path === "/" || path === "/v1/health") {
-			const pool = await loadPool(env)
-			const keys = rawKeys(env)
+			const key = apiKey(env)
 			return json({
 				ok: true,
 				service: "solu-ai-proxy",
@@ -576,12 +481,9 @@ export default {
 				videoModel: env.VIDEO_MODEL || VIDEO_MODEL_CHAIN[0],
 				videoModelChain: VIDEO_MODEL_CHAIN,
 				storage: env.STATE ? "kv" : "none",
-				keys: keys.length,
-				keyState: Object.fromEntries(
-					keys.map((k) => [fpOf(k), pool[fpOf(k)] || { ok: true }]),
-				),
+				apiKey: key ? `${key.slice(0, 11)}\u2026${key.slice(-4)}` : null,
 				scenes: SCENES.map((s) => s.id),
-				configured: keys.length > 0 && Boolean(env.APP_SHARED_SECRET),
+				configured: Boolean(key) && Boolean(env.APP_SHARED_SECRET),
 			})
 		}
 
@@ -601,23 +503,10 @@ export default {
 		/** Diagnostics: shows the upstream's real model ids and credit pricing. */
 		if (path === "/v1/upstream" && req.method === "GET") {
 			const target = url.searchParams.get("path") || "/generation-options"
-			const res = await withKeys<unknown>(env, (key) => br(target, key))
+			const res = await br<unknown>(env, target)
 			return res.ok
 				? json({ path: target, data: res.data })
 				: fail("upstream_error", res.body, res.status)
-		}
-
-		if (path === "/v1/keys" && req.method === "GET") {
-			if (url.searchParams.get("reset") === "1") {
-				if (!env.ADMIN_SECRET || url.searchParams.get("admin") !== env.ADMIN_SECRET) {
-					return fail("unauthorized", "admin secret required", 401)
-				}
-				await savePool(env, {})
-			}
-			const pool = await loadPool(env)
-			return json({
-				keys: rawKeys(env).map((k) => ({ fingerprint: fpOf(k), ...(pool[fpOf(k)] || {}) })),
-			})
 		}
 
 		/** Uploads the user's photo straight into the BlitzReels media library. */
