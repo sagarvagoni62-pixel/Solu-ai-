@@ -66,7 +66,7 @@ class SoluException implements Exception {
       case 'rate_limited':
         return 'Bahut requests. 1 minute baad try karein.';
       case 'insufficient_credits':
-        return 'Server balance khatam hai. Hum jaldi theek kar rahe hain.';
+        return 'API key ka credit khatam hai. Naye credits daalein.';
       case 'upload_failed':
         return 'Photo upload nahi hui. Internet check karein.';
       case 'upstream_error':
@@ -82,8 +82,8 @@ class SoluException implements Exception {
 }
 
 /// Talks to the Solu Worker, which runs the hidden character-sheet step and
-/// then the reference-to-video step on BlitzReels. The app only ever sees one
-/// job id and the final video.
+/// then the reference-to-video step on BlitzReels with one API key. The app
+/// only ever sees one job id and the final video.
 class SoluApi {
   SoluApi({http.Client? client}) : _http = client ?? http.Client();
   final http.Client _http;
@@ -138,42 +138,33 @@ class SoluApi {
     try {
       h = await health();
     } catch (e) {
-      out.add('server: FAIL — $e');
+      out.add('server: FAIL - $e');
       return out.join('\n');
     }
     out.add('server: OK (${h['provider']})');
-    out.add('api keys loaded: ${h['keys']}');
+    out.add('api key: ${h['apiKey'] ?? 'MISSING'}');
     out.add('configured: ${h['configured']}');
     out.add('storage: ${h['storage']}');
     out.add('image model: ${h['imageModel']}');
     out.add('video model: ${h['videoModel']}');
 
-    try {
-      final keys = await _get('/v1/keys');
-      final list = (keys['keys'] as List?) ?? const [];
-      out.add('app key: OK');
-      for (final k in list) {
-        final m = Map<String, dynamic>.from(k as Map);
-        final bad = m['invalid'] == true
-            ? 'INVALID'
-            : m['cooldownUntil'] != null
-                ? 'cooldown'
-                : 'ready';
-        out.add('  ${m['fingerprint']} → $bad ${m['lastError'] ?? ''}'.trimRight());
-      }
-    } on SoluException catch (e) {
-      out.add('app key: FAIL — ${e.code}');
-    } catch (e) {
-      out.add('app key: FAIL — $e');
-    }
-
+    // /v1/upstream needs the app key AND a working BlitzReels key, so it tests
+    // both hops at once.
     try {
       final up = await _get('/v1/upstream?path=/generation-options');
-      out.add('upstream: OK ${jsonEncode(up['data']).substring(0, 180)}…');
+      final raw = jsonEncode(up['data']);
+      out.add('app key: OK');
+      out.add(
+          'upstream: OK ${raw.substring(0, raw.length > 400 ? 400 : raw.length)}');
     } on SoluException catch (e) {
-      out.add('upstream: FAIL — ${e.code}: ${e.message}');
+      if (e.code == 'unauthorized' || e.code == 'http_401') {
+        out.add('app key: FAIL - ${e.code}');
+      } else {
+        out.add('app key: OK');
+        out.add('upstream: FAIL - ${e.code}: ${e.message}');
+      }
     } catch (e) {
-      out.add('upstream: FAIL — $e');
+      out.add('upstream: FAIL - $e');
     }
 
     return out.join('\n');
@@ -393,10 +384,9 @@ class SoluApi {
             : r.statusCode == 401
                 ? 'unauthorized'
                 : 'http_${r.statusCode}';
-    throw SoluException(
-      code,
-      (err?['message'] as String?) ??
-          (r.body.isEmpty ? 'request failed' : r.body.substring(0, r.body.length > 300 ? 300 : r.body.length)),
-    );
+    final fallback = r.body.isEmpty
+        ? 'request failed'
+        : r.body.substring(0, r.body.length > 300 ? 300 : r.body.length);
+    throw SoluException(code, (err?['message'] as String?) ?? fallback);
   }
 }
