@@ -15,7 +15,7 @@ class DiagnosticsScreen extends StatefulWidget {
 
 class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
   final _api = SoluApi();
-  String _text = 'Checking…';
+  String _text = 'Checking...';
   bool _busy = true;
 
   @override
@@ -27,7 +27,7 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
   Future<void> _run() async {
     setState(() {
       _busy = true;
-      _text = 'Checking…';
+      _text = 'Checking...';
     });
     String out;
     try {
@@ -78,8 +78,8 @@ class _DiagnosticsScreenState extends State<DiagnosticsScreen> {
             padding: const EdgeInsets.all(14),
             decoration: BoxDecoration(
               color: SoluColors.surface,
-              borderRadius: BorderRadius.circular(SoluRadius.md18),
-              border: Border.all(color: const Color(0x1FFFFFFF)),
+              borderRadius: BorderRadius.circular(SoluRadius.md),
+              border: Border.all(color: SoluColors.stroke),
             ),
             child: SelectableText(
               _text,

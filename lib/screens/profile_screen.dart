@@ -6,6 +6,7 @@ import '../core/config.dart';
 import '../core/strings.dart';
 import '../core/theme.dart';
 import '../services/history_store.dart';
+import 'diagnostics_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -63,14 +64,14 @@ class _ProfileScreenState extends State<ProfileScreen> {
   Widget build(BuildContext context) {
     return SafeArea(
       child: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 24, 20, 28),
+        padding: const EdgeInsets.fromLTRB(20, 24, 20, 120),
         children: [
           Row(
             children: [
               Container(
                 width: 62,
                 height: 62,
-                decoration: BoxDecoration(
+                decoration: const BoxDecoration(
                   gradient: SoluColors.brandGradient,
                   shape: BoxShape.circle,
                 ),
@@ -102,6 +103,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
             onTap: _pickLanguage,
           ),
           _tile(
+            icon: Icons.monitor_heart_outlined,
+            title: 'Server check',
+            onTap: () => Navigator.of(context).push(
+              MaterialPageRoute(builder: (_) => const DiagnosticsScreen()),
+            ),
+          ),
+          _tile(
             icon: Icons.privacy_tip_outlined,
             title: tr('privacy'),
             onTap: () => _open(SoluConfig.privacyUrl),
@@ -128,7 +136,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
                         TextStyle(fontSize: 12, color: SoluColors.textMuted)),
                 const SizedBox(height: 4),
                 Text(
-                  SoluConfig.isConfigured ? 'Server connected' : tr('not_configured'),
+                  SoluConfig.isConfigured
+                      ? 'Server connected'
+                      : tr('not_configured'),
                   style: TextStyle(
                     fontSize: 11.5,
                     color: SoluConfig.isConfigured
