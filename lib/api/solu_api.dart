@@ -70,6 +70,9 @@ class SoluException implements Exception {
   }
 }
 
+/// Talks to the Solu Worker, which runs the hidden character-sheet step and
+/// then the reference-to-video step on BlitzReels. The app only ever sees one
+/// job id and the final video.
 class SoluApi {
   SoluApi({http.Client? client}) : _http = client ?? http.Client();
   final http.Client _http;
@@ -98,7 +101,7 @@ class SoluApi {
 
   void _requireConfig() {
     if (!SoluConfig.isConfigured) {
-      throw SoluException('not_configured', 'SOLU_PROXY is empty');
+      throw SoluException('not_configured', 'proxy base is empty');
     }
   }
 
@@ -113,7 +116,11 @@ class SoluApi {
       if (list.isEmpty) return SceneCatalog.all;
       return list.map((e) {
         final m = Map<String, dynamic>.from(e as Map);
+        final local = SceneCatalog.byId(m['id'] as String);
         m['poster'] = SceneCatalog.posterFor(m['id'] as String);
+        m['subtitle'] ??= local?.subtitle;
+        m['category'] ??= local?.category;
+        m['featured'] ??= local?.featured;
         return Scene.fromJson(m);
       }).toList(growable: false);
     } catch (_) {
@@ -123,7 +130,8 @@ class SoluApi {
 
   // ---------------------------------------------------------------- upload
 
-  /// Uploads a local photo and returns a public URL the model can fetch.
+  /// Uploads a local photo into the generation backend and returns the asset
+  /// reference used by both generation stages.
   Future<String> uploadPhoto(File file) async {
     _requireConfig();
     try {
@@ -132,14 +140,14 @@ class SoluApi {
         ..headers['x-solu-device'] = await deviceId()
         ..files.add(await http.MultipartFile.fromPath('file', file.path));
 
-      final streamed = await req.send().timeout(const Duration(seconds: 90));
+      final streamed = await req.send().timeout(const Duration(seconds: 120));
       final res = await http.Response.fromStream(streamed);
       final body = _decode(res);
-      final url = body['url'] as String?;
-      if (url == null || url.isEmpty) {
-        throw SoluException('upload_failed', 'no url in response');
+      final ref = (body['assetId'] as String?) ?? (body['url'] as String?);
+      if (ref == null || ref.isEmpty) {
+        throw SoluException('upload_failed', 'no asset in response');
       }
-      return url;
+      return ref;
     } on SoluException {
       rethrow;
     } on TimeoutException {
@@ -151,6 +159,7 @@ class SoluApi {
 
   // ------------------------------------------------------------- generate
 
+  /// [imageRef] is the value returned by [uploadPhoto].
   Future<SoluJob> submit({
     required String sceneId,
     required String imageUrl,
@@ -159,26 +168,36 @@ class SoluApi {
     _requireConfig();
     final res = await _post('/v1/generate', {
       'sceneId': sceneId,
-      'imageUrl': imageUrl,
-      if (imageUrl2 != null && imageUrl2.isNotEmpty) 'imageUrl2': imageUrl2,
+      'assetId': imageUrl,
+      if (imageUrl2 != null && imageUrl2.isNotEmpty) 'assetId2': imageUrl2,
     });
     return SoluJob(
-      id: res['jobId'] as String,
+      id: (res['id'] as String?) ?? (res['jobId'] as String),
       sceneId: (res['sceneId'] as String?) ?? sceneId,
       seconds: (res['seconds'] as num?)?.toInt() ?? 10,
     );
   }
 
-  Future<JobState> status(String jobId) async =>
-      _parse((await _get('/v1/jobs/$jobId/status'))['status'] as String?);
+  Future<JobState> status(String jobId) async {
+    final res = await _get('/v1/jobs/$jobId/status');
+    return _parse((res['state'] as String?) ?? (res['status'] as String?));
+  }
 
   Future<SoluResult> result(String jobId) async {
     final res = await _get('/v1/jobs/$jobId');
-    final assets = ((res['assets'] as List?) ?? const [])
-        .map((e) => SoluAsset.fromJson(Map<String, dynamic>.from(e as Map)))
-        .where((a) => a.url.isNotEmpty)
-        .toList();
-    return SoluResult(_parse(res['status'] as String?), assets);
+    final assets = <SoluAsset>[];
+    final videoUrl = res['videoUrl'] as String?;
+    if (videoUrl != null && videoUrl.isNotEmpty) {
+      assets.add(SoluAsset('video', videoUrl));
+    }
+    for (final e in (res['assets'] as List?) ?? const []) {
+      final a = SoluAsset.fromJson(Map<String, dynamic>.from(e as Map));
+      if (a.url.isNotEmpty) assets.add(a);
+    }
+    return SoluResult(
+      _parse((res['state'] as String?) ?? (res['status'] as String?)),
+      assets,
+    );
   }
 
   Future<void> cancel(String jobId) async {
@@ -194,7 +213,7 @@ class SoluApi {
     String? imageUrl2,
     void Function(double progress)? onProgress,
     void Function(String jobId)? onJob,
-    Duration timeout = const Duration(minutes: 10),
+    Duration timeout = const Duration(minutes: 12),
   }) async {
     final job = await submit(
         sceneId: sceneId, imageUrl: imageUrl, imageUrl2: imageUrl2);
@@ -228,8 +247,10 @@ class SoluApi {
 
   JobState _parse(String? s) {
     switch ((s ?? '').toUpperCase()) {
+      case 'DONE':
       case 'COMPLETED':
         return JobState.completed;
+      case 'ERROR':
       case 'FAILED':
         return JobState.failed;
       case 'EXPIRED':
@@ -248,7 +269,7 @@ class SoluApi {
     try {
       final r = await _http
           .post(_u(path), headers: await _headers(), body: jsonEncode(b))
-          .timeout(const Duration(seconds: 45));
+          .timeout(const Duration(seconds: 60));
       return _decode(r);
     } on SoluException {
       rethrow;
@@ -263,7 +284,7 @@ class SoluApi {
     try {
       final r = await _http
           .get(_u(path), headers: await _headers())
-          .timeout(const Duration(seconds: 45));
+          .timeout(const Duration(seconds: 60));
       return _decode(r);
     } on SoluException {
       rethrow;
