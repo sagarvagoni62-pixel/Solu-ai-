@@ -1,7 +1,8 @@
 /// Build-time configuration.
 ///
-/// The proxy URL and app key have safe defaults baked in so CI can build
-/// without any secrets. Override them per build when needed:
+/// Nothing secret lives in this file, so the repository can be public. The
+/// app key is injected by CI from the SOLU_APP_KEY / APP_SHARED_SECRET
+/// repository secret:
 ///
 /// flutter build apk --release \
 ///   --dart-define=SOLU_PROXY=https://solu-ai-proxy.xxx.workers.dev \
@@ -13,12 +14,12 @@ class SoluConfig {
     'SOLU_PROXY',
     defaultValue: 'https://solu-ai-proxy.sagarvagoni62.workers.dev',
   );
-  static const String appKey = String.fromEnvironment(
-    'SOLU_APP_KEY',
-    defaultValue: 'solu_7f3c9a12b45e8d6041af27cc90b3e5d8',
-  );
 
-  static bool get isConfigured => proxyBase.isNotEmpty;
+  /// Empty by default on purpose: a build without the key simply cannot talk
+  /// to the backend, instead of shipping a working key to everyone.
+  static const String appKey = String.fromEnvironment('SOLU_APP_KEY');
+
+  static bool get isConfigured => proxyBase.isNotEmpty && appKey.isNotEmpty;
 
   static const String appName = 'Solu AI';
   static const String tagline = 'AI video studio for every Indian family';
